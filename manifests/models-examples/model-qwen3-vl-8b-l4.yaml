@@ -1,0 +1,34 @@
+apiVersion: kubeai.org/v1
+kind: Model
+metadata:
+  name: qwen3-vl-8b-instruct-l4
+  namespace: kubeai
+spec:
+  features: [TextGeneration]
+  # Vision model of the lab, in place of Llama 3.2 11B Vision: Meta only ships it
+  # in bf16, 21.3GB, which leaves about two on a 24GB L4 once the KV cache and the
+  # image encoder are served, and no first party FP8 of it exists. Qwen publishes
+  # the quantisation of this one itself, so the weights come from the same hands
+  # as the model, ungated and without a Hugging Face token: 10.6GB of e4m3, native
+  # on the Ada Lovelace card.
+  url: hf://Qwen/Qwen3-VL-8B-Instruct-FP8
+  engine: VLLM
+  args:
+    # The model is trained for 262144 tokens of context. What fits here is bounded
+    # by the KV cache left once the weights are resident, not by the model.
+    - --max-model-len=16384
+    - --max-num-batched-tokens=16384
+    - --gpu-memory-utilization=0.9
+    # An image prompt claims far more of a batch than a text one, and the encoder
+    # allocates in bursts, so the number of sequences in flight is kept low.
+    - --max-num-seqs=16
+    - --disable-log-requests
+  resourceProfile: nvidia-gpu-l4:1
+  # Scaled to zero, unlike the text model, because there is a single GPU node and
+  # the text model holds it. The first request grows the pool, KubeAI holding the
+  # request while the node and the replica come up, and the node is given back
+  # once the model goes idle. Raise this to 1 to keep it warm, which pins a second
+  # GPU node for as long as it runs.
+  minReplicas: 1
+  maxReplicas: 3
+  targetRequests: 20

@@ -1,0 +1,35 @@
+apiVersion: kubeai.org/v1
+kind: Model
+metadata:
+  name: llama-3.1-8b-instruct-fp8-l4
+  namespace: kubeai
+spec:
+  features: [TextGeneration]
+  url: hf://neuralmagic/Meta-Llama-3.1-8B-Instruct-FP8
+  engine: VLLM
+  args:
+    - --max-model-len=16384
+    - --max-num-batched-token=16384
+    - --gpu-memory-utilization=0.9
+    - --disable-log-requests
+  resourceProfile: nvidia-gpu-l4:1
+  # Scales to zero when unused, KubeAI holds the incoming requests while a replica
+  # starts back up. One replica per GPU, so three replicas need three GPU nodes.
+  minReplicas: 1
+  maxReplicas: 3
+  # Number of in flight requests per replica the autoscaler aims for. The KubeAI
+  # default is 100, which is a lot of concurrency before a second replica appears.
+  #
+  # This is a quality setting rather than a capacity one. Measured on one L4 with
+  # short conversations, the replica never queues a request and never preempts, and
+  # throughput was still climbing at 64 in flight; what degrades is the speed each
+  # user sees, from 27 tokens per second on an idle replica to 24 at 20 in flight,
+  # 20 at 40, and 18 at 64. Forty holds every user above twenty tokens per second,
+  # comfortably faster than reading speed, and gets close to twice the work out of
+  # the GPU before asking for another one.
+  #
+  # Raise it only as far as the traffic stays short. The KV cache holds 77312
+  # tokens, so forty of these ~300 token conversations occupy well under a quarter
+  # of it, but forty requests using the full 16384 token context would need four
+  # times the cache there is and the replica would preempt continuously.
+  targetRequests: 40

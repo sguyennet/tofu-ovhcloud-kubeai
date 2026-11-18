@@ -1,0 +1,25 @@
+# OpenTofu working directory and local state (state holds credentials)
+.terraform/
+*.tfstate
+*.tfstate.*
+crash.log
+crash.*.log
+*.tfplan
+tfplan
+
+# Local configuration, may hold secrets
+*.tfvars
+*.tfvars.json
+ovhrc.sh
+override.tf
+override.tf.json
+*_override.tf
+*_override.tf.json
+
+# Generated cluster credentials
+kubeconfig
+kubeconfig.yml
+kubeconfig.yaml
+
+# vLLM checkout used as the image build context (see image/README.md)
+image/vllm/

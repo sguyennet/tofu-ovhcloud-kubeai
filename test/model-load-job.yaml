@@ -1,0 +1,151 @@
+# Sustained load against the KubeAI OpenAI endpoint, to watch the model autoscaler
+# add and remove replicas.
+#
+# Sizing. The model asks for 40 in flight requests per replica (targetRequests),
+# and the autoscaler averages what it measures over a ten minute window, so the
+# decision follows the average rather than the current load: holding C requests in
+# flight, the average climbs towards C and crosses a threshold T after about
+# 10 * T / C minutes. With the 48 below, the second replica is asked for after
+# roughly eight minutes, and the third is never asked for, since an average of 48
+# never reaches the 80 it needs. Raise CONCURRENCY past 80 to reach three.
+#
+# The requests go straight to the KubeAI service. Sending them through the public
+# Open WebUI URL instead would measure the rate limit on its ingress, which denies
+# well below this concurrency.
+#
+#   kubectl apply -f test/model-load-job.yaml
+#   kubectl logs -n kubeai job/model-load -f
+#   kubectl get pods -n kubeai -l kubeai.org/model=llama-3.1-8b-instruct-fp8-l4 -w
+#   kubectl get cm kubeai-autoscaler-state -n kubeai -o jsonpath='{.data}'
+#   kubectl delete -f test/model-load-job.yaml
+#
+# A replica landing on a GPU node that is already up serves within a minute. One
+# that needs a new node waits for it to be provisioned and for the 14GB vLLM image
+# to be pulled, which takes a good ten minutes on this cluster.
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: model-load
+  namespace: kubeai
+spec:
+  backoffLimit: 0
+  # Keeps the logs readable for an hour after the run, then cleans up by itself.
+  ttlSecondsAfterFinished: 3600
+  template:
+    metadata:
+      labels:
+        app: model-load
+    spec:
+      restartPolicy: Never
+      automountServiceAccountToken: false
+      # The GPU nodes are tainted for the models, this only needs a little CPU.
+      nodeSelector:
+        pool: control-plane
+
+      containers:
+        - name: load
+          image: python:3.13-alpine
+
+          env:
+            - name: KUBEAI_URL
+              value: http://kubeai.kubeai.svc.cluster.local/openai/v1/chat/completions
+            - name: MODEL
+              value: llama-3.1-8b-instruct-fp8-l4
+            # Requests held in flight, and for how long, in seconds.
+            - name: CONCURRENCY
+              value: "48"
+            - name: DURATION
+              value: "900"
+            # Long enough that a request occupies its slot for a few seconds.
+            - name: MAX_TOKENS
+              value: "256"
+
+          resources:
+            requests:
+              cpu: 200m
+              memory: 128Mi
+            limits:
+              cpu: "1"
+              memory: 512Mi
+
+          securityContext:
+            runAsNonRoot: true
+            runAsUser: 1000
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+
+          command: ["python3", "-c"]
+          args:
+            - |
+              import json
+              import os
+              import threading
+              import time
+              import urllib.request
+
+              url = os.environ["KUBEAI_URL"]
+              concurrency = int(os.environ["CONCURRENCY"])
+              duration = int(os.environ["DURATION"])
+
+              body = json.dumps({
+                  "model": os.environ["MODEL"],
+                  "messages": [{
+                      "role": "user",
+                      "content": "Explain in three paragraphs how an autoscaler "
+                                 "decides to add a replica.",
+                  }],
+                  "max_tokens": int(os.environ["MAX_TOKENS"]),
+                  "temperature": 0.7,
+              }).encode()
+
+              deadline = time.time() + duration
+              lock = threading.Lock()
+              completed = 0
+              failed = 0
+              last_error = ""
+              latencies = []
+
+
+              def worker():
+                  global completed, failed, last_error
+                  while time.time() < deadline:
+                      started = time.time()
+                      request = urllib.request.Request(
+                          url, data=body, headers={"Content-Type": "application/json"})
+                      try:
+                          with urllib.request.urlopen(request, timeout=300) as answer:
+                              answer.read()
+                          with lock:
+                              completed += 1
+                              latencies.append(time.time() - started)
+                      except Exception as error:
+                          with lock:
+                              failed += 1
+                              last_error = str(error)[:100]
+
+
+              threads = [threading.Thread(target=worker, daemon=True)
+                         for _ in range(concurrency)]
+              for thread in threads:
+                  thread.start()
+
+              # A drop in latency, or a jump in the number of answers per window, is
+              # the client side view of a replica joining.
+              started_at = time.time()
+              while time.time() < deadline:
+                  time.sleep(15)
+                  with lock:
+                      window = latencies[:]
+                      del latencies[:]
+                      totals = (completed, failed, last_error)
+                  mean = sum(window) / len(window) if window else 0
+                  print("t=%4ds concurrency=%d answered=%d failed=%d "
+                        "last15s=%d mean_latency=%.1fs %s"
+                        % (time.time() - started_at, concurrency, totals[0],
+                           totals[1], len(window), mean, totals[2]), flush=True)
+
+              for thread in threads:
+                  thread.join(timeout=310)
+              print("finished: answered=%d failed=%d" % (completed, failed), flush=True)
